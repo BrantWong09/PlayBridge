@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<LinearLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+
+    android:orientation="vertical"
+    android:padding="16dp">
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+
+        android:text="PlayBridge"
+        android:textSize="20sp"
+        android:textStyle="bold" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+
+        android:orientation="horizontal"
+        android:layout_marginTop="8dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+
+            android:text="Windows: "
+            android:textSize="14sp"
+            android:gravity="center_vertical" />
+
+        <EditText
+            android:id="@+id/server"
+
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+
+            android:inputType="text"
+            android:textSize="14sp"
+            android:hint="IP:端口，如 10.0.2.2:16888" />
+
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/status"
+
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+
+        android:layout_marginTop="8dp"
+
+        android:text="等待播放请求…"
+        android:textSize="15sp"
+        android:textStyle="bold"
+        android:textColor="#0B6623" />
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+
+        android:layout_weight="1"
+        android:layout_marginTop="12dp">
+
+        <TextView
+            android:id="@+id/output"
+
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+
+            android:textIsSelectable="true"
+            android:textSize="14sp" />
+
+    </ScrollView>
+
+    <Button
+        android:id="@+id/copy"
+
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+
+        android:text="复制全部信息" />
+
+</LinearLayout>

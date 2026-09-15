@@ -1,0 +1,27 @@
+# Android / Gradle
+FakePlayerProbe/.gradle/
+FakePlayerProbe/build/
+FakePlayerProbe/app/build/
+FakePlayerProbe/local.properties
+FakePlayerProbe/debug.keystore
+*.apk
+
+# Python 运行时产物
+PlayBridgeHost/*.log
+PlayBridgeHost/run.out
+PlayBridgeHost/run.err
+PlayBridgeHost/last_play.json
+PlayBridgeHost/real_baidu_url.txt
+PlayBridgeHost/live_url.txt
+PlayBridgeHost/__pycache__/
+PlayBridgeHost/debug_capture
+*.bin
+*.pcap
+
+# 临时调试/抓包
+tmp/
+devtools/
+$RECYCLE.BIN/
+
+PlayBridgeHost/*_url.txt
+PlayBridgeHost/mpv_test*.out

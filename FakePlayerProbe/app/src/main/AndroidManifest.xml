@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 控制通道：向 Windows Host 发 POST -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:theme="@style/AppTheme"
+        android:label="PlayBridge"
+        android:usesCleartextTraffic="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+
+            <!-- 桌面图标入口 -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- 注册为视频外部播放器候选：
+                 TVBox 系 app 发出的 VIEW intent 通常同时带 URI(scheme) 和 mimeType，
+                 Android 匹配规则要求两者都命中，所以必须显式声明 scheme 列表 -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data android:scheme="http" />
+                <data android:scheme="https" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:scheme="rtsp" />
+                <data android:scheme="rtmp" />
+                <data android:scheme="rtmps" />
+                <data android:scheme="ftp" />
+                <data android:scheme="hls" />
+                <data android:scheme="mms" />
+                <data android:scheme="udp" />
+                <data android:scheme="tcp" />
+                <data android:scheme="ws" />
+                <data android:scheme="wss" />
+                <data android:scheme="smb" />
+            </intent-filter>
+
+            <!-- 关键：同时带 URI(scheme) + mimeType 的 intent，
+                 必须在同一个 filter 里同时声明两者才能匹配 -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data android:scheme="http" />
+                <data android:scheme="https" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:scheme="rtsp" />
+                <data android:scheme="rtmp" />
+                <data android:scheme="rtmps" />
+                <data android:scheme="ftp" />
+                <data android:scheme="hls" />
+                <data android:scheme="mms" />
+                <data android:scheme="udp" />
+                <data android:scheme="tcp" />
+                <data android:scheme="ws" />
+                <data android:scheme="wss" />
+                <data android:scheme="smb" />
+
+                <data android:mimeType="video/*" />
+                <data android:mimeType="audio/*" />
+                <data android:mimeType="application/x-mpegURL" />
+                <data android:mimeType="application/vnd.apple.mpegurl" />
+                <data android:mimeType="application/dash+xml" />
+                <data android:mimeType="application/mp4" />
+            </intent-filter>
+
+            <!-- 兜底：只带 mimeType、不带 URI 的 intent -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data android:mimeType="video/*" />
+                <data android:mimeType="audio/*" />
+                <data android:mimeType="application/x-mpegURL" />
+                <data android:mimeType="application/vnd.apple.mpegurl" />
+                <data android:mimeType="application/dash+xml" />
+                <data android:mimeType="application/mp4" />
+            </intent-filter>
+
+        </activity>
+
+    </application>
+
+</manifest>
