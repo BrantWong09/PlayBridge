@@ -24,8 +24,9 @@ RELAY_PORT = 18095
 USE_RELAY = True
 CHUNK = 1 << 20
 READ_BLOCK = 1 << 16
-SILENT = 2.5           # 泵流静默判死（秒）
+SILENT = 8.0           # 泵流静默判死（秒）——代理缓存满会短暂停顿，别误杀
 ROTATE = 64 << 20      # 每条流最多喂 64MB 就轮换重开
+MAX_STRIKES = 4        # 连续建流失败次数上限，超过则泵死亡（不再风暴）
 RING_MAX = 200 << 20   # 超前 mpv 最多缓存量
 LOOKBACK = 24 << 20    # 滞后 mpv 保留量
 BYPASS_CHUNK = 32 << 20
@@ -55,7 +56,10 @@ class Pump:
         self.ctype = "video/x-matroska"
         self.eof = False
         self.dead = False
+        self.disposed = False
         self.started = False
+        self.strikes = 0
+        self.gen = 0                 # 重定代次：变了就让当前流作废
 
     # ---------- 泵 ----------
     def start(self):
@@ -63,18 +67,59 @@ class Pump:
             self.started = True
             threading.Thread(target=self._pump_loop, daemon=True).start()
 
+    def retarget(self, pos):
+        """消费者跳到新位置：把泵重定过去，让环跟着新位置长。
+
+        不这么做的话，跳转后的整段播放只能靠 _bypass 一条条并发拉上游流，
+        代理扛不住（实测几个请求就把代理打到不应答）。
+        """
+        with self.lock:
+            self.gen += 1
+            self.base = pos
+            self.read_pos = pos
+            self.served = pos
+            del self.buf[:]
+            self.lock.notify_all()
+        self.log("ring: 泵重定到 %d" % pos)
+
+    def _hard_close(self, conn):
+        """带未读数据的 HTTPConnection.close() 可能阻塞甚至不真关；
+        直接掐 socket（linger=0 → 发 RST，代理立即释放会话槽）。"""
+        try:
+            sock = getattr(conn, "sock", None)
+            if sock is not None:
+                import socket as _s
+                try:
+                    sock.setsockopt(_s.SOL_SOCKET, _s.SO_LINGER,
+                                    _s.struct.pack("ii", 1, 0))
+                except Exception:
+                    pass
+                sock.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
     def _pump_loop(self):
         try:
             conn = http.client.HTTPConnection(self.host, self.port,
                                               timeout=SILENT)
             with self.lock:
                 start = self.read_pos
+                gen = self.gen
+                old = getattr(self, "_cur_conn", None)
+            if old is not None:
+                self._hard_close(old)
             conn.request("GET", self.path, headers={
                 "User-Agent": UA, "Accept": "*/*",
                 "Range": "bytes=%d-" % start, "Icy-MetaData": "1"})
             r = conn.getresponse()
             if r.status not in (200, 206):
                 raise UpstreamError("status %s" % r.status)
+            self._cur_conn = conn
+            self.strikes = 0
             cr = r.getheader("Content-Range") or ""
             m = re.match(r"bytes (\d+)-", cr)
             pos = int(m.group(1)) if m else start
@@ -83,15 +128,36 @@ class Pump:
             with self.lock:
                 if m2 and not self.total:
                     self.total = int(m2.group(1))
-                if pos != self.read_pos or self.read_pos - self.base > len(self.buf):
-                    # 流起点与环尾不一致：以流为准，重建环尾对齐
-                    keep = max(0, pos - LOOKBACK - self.base)
-                    del self.buf[:keep]
-                    self.base = pos - len(self.buf)
-                    self.read_pos = pos
-                self.log("ring: 泵流 bytes=%d-" % pos)
+                if self.gen != gen:
+                    # 建流期间被重定：这条流作废，别拿它的原点去对齐环
+                    stale_open = True
+                else:
+                    stale_open = False
+                    if pos != self.read_pos \
+                            or self.read_pos - self.base > len(self.buf):
+                        # 流起点与环尾不一致：以流为准，重建环尾对齐
+                        keep = max(0, pos - LOOKBACK - self.base)
+                        del self.buf[:keep]
+                        self.base = pos - len(self.buf)
+                        self.read_pos = pos
+                    self.log("ring: 泵流 bytes=%d-" % pos)
+            if stale_open:
+                self._hard_close(conn)
+                time.sleep(0.1)
+                self._pump_loop()
+                return
             fed = 0
             while True:
+                if self.disposed:
+                    self._hard_close(conn)
+                    return
+                if self.gen != gen:
+                    # 被重定：弃掉这条流，用新的 read_pos 重建
+                    self.log("ring: 泵被重定，弃掉这条流 (t=%dMB)" % (pos >> 20))
+                    self._hard_close(conn)
+                    time.sleep(0.1)
+                    self._pump_loop()
+                    return
                 try:
                     more = r.read(READ_BLOCK)
                 except Exception:
@@ -106,47 +172,64 @@ class Pump:
                                 self.log("ring: 泵流提前EOF(t=%dMB) → 轮换"
                                          % (pos >> 20))
                     with self.lock:
-                        self.read_pos = pos
+                        if self.gen == gen:
+                            self.read_pos = pos
                         self.lock.notify_all()
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-                    if self.eof:
+                    self._hard_close(conn)
+                    if self.eof or self.disposed:
                         return
                     time.sleep(0.2)
                     self._pump_loop()
                     return
                 with self.lock:
-                    gap = pos - self.base          # 拼接点：应 == len(buf)
-                    self.buf += more
-                    pos += len(more)
-                    fed += len(more)
-                    self.read_pos = pos
-                    # 修剪：不早于 served-LOOKBACK，总量受 served+RING_MAX 约束
-                    min_keep = self.served - LOOKBACK
-                    if self.base < min_keep:
-                        drop = min_keep - self.base
-                        del self.buf[:drop]
-                        self.base = min_keep
-                    if self.read_pos - self.served > RING_MAX:
-                        # 等 mpv 消费（环满；泵暂歇，代理静默由轮换兜底）
-                        self.lock.wait(0.2)
-                    self.lock.notify_all()
+                    if self.gen != gen:
+                        stale = True
+                    else:
+                        stale = False
+                        self.buf += more
+                        pos += len(more)
+                        fed += len(more)
+                        self.read_pos = pos
+                        # 修剪：不早于 served-LOOKBACK，总量受 served+RING_MAX 约束
+                        min_keep = self.served - LOOKBACK
+                        if self.base < min_keep:
+                            drop = min_keep - self.base
+                            del self.buf[:drop]
+                            self.base = min_keep
+                        if self.read_pos - self.served > RING_MAX:
+                            # 等 mpv 消费（环满；泵暂歇，代理静默由轮换兜底）
+                            self.lock.wait(0.2)
+                        self.lock.notify_all()
+                if stale:
+                    self.log("ring: 泵被重定，弃掉这条流 (t=%dMB)" % (pos >> 20))
+                    self._hard_close(conn)
+                    time.sleep(0.1)
+                    self._pump_loop()
+                    return
                 if fed >= ROTATE:
                     self.log("ring: 泵流满 %dMB → 主动轮换" % (pos >> 20))
                     with self.lock:
-                        self.read_pos = pos
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
+                        if self.gen == gen:
+                            self.read_pos = pos
+                    self._hard_close(conn)
+                    if self.disposed:
+                        return
                     time.sleep(0.15)
                     self._pump_loop()
                     return
         except Exception as e:
-            self.log("ring: 泵流建流失败 %r，1s后重试" % e)
-            time.sleep(1.0)
+            self.strikes += 1
+            if self.strikes >= MAX_STRIKES:
+                self.log("ring: 泵流连续 %d 次建流失败(%r)，泵停止" % (
+                    self.strikes, e))
+                with self.lock:
+                    self.dead = True
+                    self.lock.notify_all()
+                return
+            wait = min(2 ** self.strikes, 8)
+            self.log("ring: 泵流建流失败 %r，%ds后重试(%d/%d)" % (
+                e, wait, self.strikes, MAX_STRIKES))
+            time.sleep(wait)
             try:
                 self._pump_loop()
             except Exception as e2:
@@ -174,10 +257,7 @@ class Pump:
                 data += more
             return data
         finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
+            self._hard_close(conn)
 
     # ---------- 对 mpv ----------
     def wait_for(self, upto):
@@ -192,6 +272,10 @@ class Pump:
         # 大跨度前跳：泵追不上，直接旁路（否则等 20s 才反应过来）
         with self.lock:
             if start > self.read_pos + 4 * CHUNK or start < self.base:
+                why = ("前跳" if start > self.read_pos + 4 * CHUNK
+                       else "回看已修剪")
+                self.log("ring: get(%d) %s → 旁路 (read_pos=%d base=%d)" % (
+                    start, why, self.read_pos, self.base))
                 return self._bypass(start, min(end - start + 1, BYPASS_CHUNK))
         got = None
         for _ in range(80):          # 最多等 20s
@@ -204,16 +288,23 @@ class Pump:
                     break            # 被修剪 → 旁路
             self.wait_for(start + 1)
         if got is None:
+            self.log("ring: get(%d) 等 20s 仍无数据 → 旁路 (read_pos=%d base=%d"
+                     " served=%d eof=%s dead=%s)" % (
+                         start, self.read_pos, self.base, self.served,
+                         self.eof, self.dead))
             return self._bypass(start, min(end - start + 1, BYPASS_CHUNK))
-        need = end - start + 1
-        if len(got) >= need:
-            return got[:need]
-        return got + self._bypass(start + len(got), need - len(got))
+        # 环里有多少先给多少：缺口由泵继续追，调用方会续请求。
+        # _bypass 只留给跳读/回看落空——它会并发开第二条上游流，代理扛不住。
+        return got
 
 
 def set_target(target_url, log=lambda m: None):
     global _current
     with _current_lock:
+        old = _current
+        if old is not None:
+            old.disposed = True     # 让旧泵退出并 RST 掐线，释放代理会话
+            _current = None
         try:
             _current = Pump(target_url, log)
         except Exception as e:
@@ -235,6 +326,40 @@ def ensure_started(port=RELAY_PORT, log=lambda m: None):
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
+        def _stream_from(self, pump, start, code=206):
+            """把 [start, 文件尾) 作为一条长响应一路写下去。
+
+            不能像短响应那样在 32MB 处收尾：mpv/ffmpeg 会把"响应正常结束"
+            当成文件结束（实测只播十几秒就 EOF），所以开放式请求必须流到
+            total；播放器跳转时会自己掐掉旧连接，这里按断开收尾即可。
+            """
+            if not pump.total:
+                pump.wait_for(start + 1)      # 等首包，拿 ctype/total
+            total = pump.total
+            self.send_response(code)
+            self.send_header("Content-Type", pump.ctype)
+            self.send_header("Accept-Ranges", "bytes")
+            if total:
+                self.send_header("Content-Range",
+                                 "bytes %d-%d/%d" % (start, total - 1, total))
+                self.send_header("Content-Length", str(total - start))
+            else:
+                self.close_connection = True
+                self.send_header("Connection", "close")
+            self.end_headers()
+            pos = start
+            while True:
+                data = pump.get(pos, pos + (8 << 20) - 1)
+                if not data:
+                    break
+                try:
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    return          # 播放器跳走了，正常收场
+                pos += len(data)
+                if pos <= pump.served + RING_MAX:
+                    pump.served = max(pump.served, pos)
+
         def do_GET(self):
             with _current_lock:
                 pump = _current
@@ -245,17 +370,16 @@ def ensure_started(port=RELAY_PORT, log=lambda m: None):
             m = re.match(r"bytes=(\d+)-(\d*)",
                          self.headers.get("Range") or "")
             try:
-                if m:
+                if m and m.group(2):
+                    # bytes=X-Y（显式终点）：一次性短响应，够 ExoPlayer 式拉取
                     start = int(m.group(1))
-                    if m.group(2):
-                        end = int(m.group(2))
-                    else:
-                        end = (pump.total - 1) if pump.total \
-                            else start + BYPASS_CHUNK - 1
+                    end = min(int(m.group(2)), start + BYPASS_CHUNK - 1)
                     if pump.total:
                         end = min(end, pump.total - 1)
-                    end = min(end, start + BYPASS_CHUNK - 1)
                     data = pump.get(start, end)
+                    if not data:
+                        log("ring: Range %d-%d 拿到空数据 → 只能回空响应 "
+                            "(total=%s)" % (start, end, pump.total))
                     self.send_response(206)
                     self.send_header("Content-Type", pump.ctype)
                     self.send_header("Accept-Ranges", "bytes")
@@ -267,26 +391,24 @@ def ensure_started(port=RELAY_PORT, log=lambda m: None):
                         self.wfile.write(data)
                     except (BrokenPipeError, ConnectionResetError):
                         pass
-                    pump.served = max(pump.served, start + len(data))
-                else:
-                    pump.wait_for(1)   # 等首包，拿 ctype/total
-                    self.send_response(200)
-                    self.send_header("Content-Type", pump.ctype)
-                    self.send_header("Accept-Ranges", "bytes")
-                    if pump.total:
-                        self.send_header("Content-Length", str(pump.total))
-                    else:
-                        self.close_connection = True
-                        self.send_header("Connection", "close")
-                    self.end_headers()
-                    pos = 0
-                    while True:
-                        data = pump.get(pos, pos + (8 << 20) - 1)
-                        if not data:
-                            break
-                        self.wfile.write(data)
-                        pos += len(data)
-                        pump.served = pos
+                    # served 只跟顺序读走。mpv 为拿 mkv 索引会顺手读一次文件
+                    # 尾部，若把这种远距离随机读记进 served，环的修剪基线会
+                    # 瞬间跳到文件尾，之后所有正常读都被判成"回看已修剪"而
+                    # 走旁路（曾导致播十几秒就断流）。
+                    if start <= pump.served + RING_MAX:
+                        pump.served = max(pump.served, start + len(data))
+                    return
+                # bytes=X- 或无 Range：开放式，一条长响应流到文件尾
+                start = int(m.group(1)) if m else 0
+                if pump.total:
+                    if start > pump.read_pos + 4 * CHUNK \
+                            and start < pump.total - (1 << 20):
+                        # 真跳转（排除掉读文件尾索引那种随机读）：让泵跟到
+                        # 新位置，否则整段播放都得靠旁路并发拉上游。
+                        pump.retarget(start)
+                    elif start + CHUNK < pump.base:
+                        pump.retarget(start)      # 回看超出环
+                self._stream_from(pump, start, 206 if m else 200)
             except Exception as e:
                 log("ring: 请求失败 %r" % e)
                 try:

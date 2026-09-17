@@ -17,6 +17,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import ring_relay
+import mpv_gate
 
 PORT = 16888
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -195,7 +196,8 @@ def handle_play(data):
         "--demuxer-max-bytes=256MiB",
         "--demuxer-max-back-bytes=64MiB",
         "--cache=yes",
-        "--cache-secs=60",
+        "--cache-secs=30",                # 预缓冲目标：攒够 30s 再开播
+        "--demuxer-cache-wait=yes",       # 起播前先等缓存达标（实测有效）
     ]
     if is_proxy and not ring_relay.USE_RELAY:
         # kaiser 代理按 UA 白名单区别响应：必须伪装成影视仓自家 ExoPlayer
@@ -210,6 +212,7 @@ def handle_play(data):
     try:
         mpv_proc = subprocess.Popen(args)
         log("  mpv 已拉起 (pid=%d)" % mpv_proc.pid)
+        mpv_gate.start(log)               # seek 后重新攒够预缓冲再放行
         bring_mpv_to_front(mpv_proc.pid)
 
         def watch(proc=mpv_proc, u=play_url):

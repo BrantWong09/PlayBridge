@@ -25,3 +25,8 @@ $RECYCLE.BIN/
 
 PlayBridgeHost/*_url.txt
 PlayBridgeHost/mpv_test*.out
+
+# 诊断产物：截图 / 临时文件 / 改动备份
+PlayBridgeHost/*.png
+PlayBridgeHost/mpv_rect.txt
+PlayBridgeHost/*.wip-backup
