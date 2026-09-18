@@ -29,6 +29,8 @@ ADB = r"C:\Users\Administrator\AppData\Local\Android\Sdk\platform-tools\adb.exe"
 DEVICE = "127.0.0.1:16416"        # 影视仓所在的 MuMu 实例（MuMuManager 查询所得）
 PROXY_PORT = 8096                 # 模拟器内影视仓代理端口
 FORWARD_PORT = 18096              # Windows 本地隧道端口
+WUKONG_PKG = "com.huawei.himovceie"                              # 影视仓包名
+WUKONG_ACT = "com.github.tvbox.osc.ui.activity.HomeActivity"     # 启动 Activity
 
 mpv_proc = None
 
@@ -65,6 +67,24 @@ def ensure_forward():
                 % (FORWARD_PORT, DEVICE, PROXY_PORT))
     except (OSError, subprocess.TimeoutExpired) as e:
         log("adb forward 异常: %s" % e)
+
+
+def restart_proxy():
+    """上游代理挂死时重启影视仓，重建 new_go_proxy_wex。
+
+    实测代理被喂挂后不会再应答，只有重启进程才能恢复；重启后同一条
+    百度直链仍可经新代理继续播放，播放器不用换源。
+    """
+    try:
+        subprocess.run([ADB, "-s", DEVICE, "shell", "am", "force-stop",
+                        WUKONG_PKG], capture_output=True, timeout=15)
+        time.sleep(1)
+        subprocess.run([ADB, "-s", DEVICE, "shell", "am", "start", "-n",
+                        "%s/%s" % (WUKONG_PKG, WUKONG_ACT)],
+                       capture_output=True, timeout=15)
+        log("ring: 已重启影视仓以恢复上游代理")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log("ring: 重启影视仓失败: %s" % e)
 
 
 def rewrite_url(url):
@@ -246,6 +266,8 @@ def main():
     host_ip = socket.gethostbyname(socket.gethostname())
     # 上游持续不可用时重跑 adb forward（隧道也可能掉），让泵自动恢复
     ring_relay.set_reconnect_hook(ensure_forward)
+    # 代理被喂挂（持续不可用）时重启影视仓，重建代理进程
+    ring_relay.set_proxy_restart_hook(restart_proxy)
     log("PlayBridge Host 启动: 端口 %d (本机IP %s)" % (PORT, host_ip))
     try:
         server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)

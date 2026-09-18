@@ -30,6 +30,8 @@ ROTATE = 512 << 20     # 每条流最多喂 512MB 才主动轮换：轮换会 ab
 MAX_STRIKES = 4        # 超过此次数后转入"持续重连"（不再永久判死）
 RECONNECT_MAX = 60.0   # 持续重连时的退避上限（秒）：别高频冲击已挂的代理
 RECONNECT_HOOK_MIN = 60.0  # 重连钩子（重跑 adb forward）最小间隔（秒）
+PROXY_RESTART_AFTER = 25.0     # 上游持续不可用这么久 → 判定代理挂死
+PROXY_RESTART_COOLDOWN = 120.0  # 两次"重启代理"的最小间隔（秒）
 RING_MAX = 200 << 20   # 超前 mpv 最多缓存量
 LOOKBACK = 24 << 20    # 滞后 mpv 保留量
 BYPASS_CHUNK = 32 << 20
@@ -40,12 +42,19 @@ UA = "com.android.chrome/131.0.6778.200 (Linux;Android 10) AndroidXMedia3/1.5.1"
 _current = None
 _current_lock = threading.Lock()
 _reconnect_hook = None
+_proxy_restart_hook = None
 
 
 def set_reconnect_hook(fn):
     """注册持续重连时调用的钩子（如重跑 adb forward）。"""
     global _reconnect_hook
     _reconnect_hook = fn
+
+
+def set_proxy_restart_hook(fn):
+    """注册"代理挂死时重启上游代理"的钩子（如重启影视仓）。"""
+    global _proxy_restart_hook
+    _proxy_restart_hook = fn
 
 
 class UpstreamError(Exception):
@@ -73,6 +82,8 @@ class Pump:
         self.strikes = 0
         self.gen = 0                 # 重定代次：变了就让当前流作废
         self._last_hook = 0.0        # 上次重连钩子的时间
+        self._fail_since = None      # 本轮连续失败起点
+        self._last_restart = 0.0     # 上次重启代理的时间
         # 上游串行化：实测代理一次只服务一条流，并发会互相挤死。
         self._upstream_lock = threading.Lock()  # 保证同时只有一个 _bypass
         self._pause_req = False      # 旁路请求泵让出上游
@@ -162,6 +173,7 @@ class Pump:
                     raise UpstreamError("status %s" % r.status)
                 self._cur_conn = conn
                 self.strikes = 0
+                self._fail_since = None
                 cr = r.getheader("Content-Range") or ""
                 m = re.match(r"bytes (\d+)-", cr)
                 pos = int(m.group(1)) if m else start
@@ -282,11 +294,13 @@ class Pump:
                     self.lock.notify_all()
                 if self.disposed:
                     return
+                now = time.time()
+                if self._fail_since is None:
+                    self._fail_since = now
                 self.strikes += 1
                 if self.strikes >= MAX_STRIKES:
                     self.log("ring: 上游连续 %d 次不可用(%r)，持续重连"
                              % (self.strikes, e))
-                    now = time.time()
                     if (_reconnect_hook is not None
                             and now - self._last_hook >= RECONNECT_HOOK_MIN):
                         self._last_hook = now
@@ -294,6 +308,17 @@ class Pump:
                             _reconnect_hook()
                         except Exception as e2:
                             self.log("ring: 重连钩子失败 %r" % e2)
+                    if (now - self._fail_since >= PROXY_RESTART_AFTER
+                            and now - self._last_restart
+                            >= PROXY_RESTART_COOLDOWN
+                            and _proxy_restart_hook is not None):
+                        self._last_restart = now
+                        self._fail_since = now     # 给重启后的代理一个窗口
+                        self.log("ring: 上游持续不可用 → 重启上游代理")
+                        try:
+                            _proxy_restart_hook()
+                        except Exception as e2:
+                            self.log("ring: 重启代理钩子失败 %r" % e2)
                 wait = min(2 ** min(self.strikes, 6), RECONNECT_MAX)
                 self.log("ring: 泵流建流失败 %r，%.0fs后重试(%d/%d)" % (
                     e, wait, self.strikes, MAX_STRIKES))
@@ -437,7 +462,11 @@ def ensure_started(port=RELAY_PORT, log=lambda m: None):
                 self.send_header("Connection", "close")
             self.end_headers()
             pos = start
+            gen0 = pump.gen
             while True:
+                if pump.gen != gen0:
+                    # 被新的 seek 重定：结束这条旧响应，别在旧位置触发旁路
+                    break
                 data = pump.get(pos, pos + (8 << 20) - 1)
                 if not data:
                     break

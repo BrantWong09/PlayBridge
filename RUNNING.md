@@ -144,20 +144,33 @@ python watch_session.py 270 30   # 观察 270 秒，每 30 秒采样一次
 因此中继对上游**严格串行化**：主泵与旁路（读 mkv 索引 / 跳转）不会并发，
 需要旁路时先让泵断开，跑完再从原位置续传。每 ~60 秒代理 EOF 一次、中继顺序重连一次是正常节奏。
 
+### 代理看门狗（自动恢复）
+
+代理一旦被喂挂就不会再应答，只能重启进程。Host 内置看门狗：上游**持续不可用
+超过 `PROXY_RESTART_AFTER`（25s）** 时自动重启影视仓（`am force-stop` + 重新拉起），
+重建 `new_go_proxy_wex`；重启后同一条直链继续播，播放器不用换源。
+两次重启至少间隔 `PROXY_RESTART_COOLDOWN`（120s）。
+
+- 日志标志：`ring: 上游持续不可用 → 重启上游代理` / `ring: 已重启影视仓以恢复上游代理`。
+- 相关常量：`ring_relay.py` 的 `PROXY_RESTART_AFTER` / `PROXY_RESTART_COOLDOWN`；
+  影视仓包名/Activity 在 `playbridge_host.py` 的 `WUKONG_PKG` / `WUKONG_ACT`。
+- 注意：看门狗会**强制重启影视仓**（它的界面会重置），但 mpv 播放会自动续上。
+
 出现「播几分钟后所有重连都 `TimeoutError`」时，按顺序排查：
 
-1. 确认代理是否已挂死（在 Windows 上）：
+1. 先看日志有没有 `重启上游代理`——正常情况下看门狗已经处理，播放会自己恢复。
+2. 若没有恢复，确认代理是否已挂死（在 Windows 上）：
    ```powershell
    adb -s 127.0.0.1:16416 shell "netstat -tn | grep 8096"
    ```
    若出现多条 `CLOSE_WAIT` 且 send-q 卡着数字，代理多半已挂。
-2. 重启影视仓清掉代理：
+3. 手动重启影视仓清掉代理：
    ```powershell
    adb -s 127.0.0.1:16416 shell am force-stop com.huawei.himovceie
    adb -s 127.0.0.1:16416 shell am start -n com.huawei.himovceie/com.github.tvbox.osc.ui.activity.HomeActivity
    ```
-3. 确认同一时刻只有一个客户端在连代理（Host 只开一个）。
-4. 若怀疑中继又开了并发上游，跑 `python test_relay_serial.py`（应为 PASS）。
+4. 确认同一时刻只有一个客户端在连代理（Host 只开一个）。
+5. 若怀疑中继又开了并发上游，跑 `python tests\test_relay_serial.py`（应为 PASS）。
 
 ## 8. 停止
 
