@@ -13,7 +13,7 @@ PlayBridgeHost/run.err
 PlayBridgeHost/last_play.json
 PlayBridgeHost/real_baidu_url.txt
 PlayBridgeHost/live_url.txt
-PlayBridgeHost/__pycache__/
+__pycache__/
 PlayBridgeHost/debug_capture
 *.bin
 *.pcap

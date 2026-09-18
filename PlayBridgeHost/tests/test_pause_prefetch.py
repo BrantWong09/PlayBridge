@@ -13,9 +13,6 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 MPV = r"C:\Users\Administrator\AppData\Roaming\com.geon.quantumtv\mpv\mpv.exe"
 PIPE = r"\\.\pipe\pb_test"
 TOTAL = int(sys.argv[1]) if len(sys.argv) > 1 else 60
-URL = open("probe_url.txt", encoding="utf-8").read().strip()
-URL = URL.replace("127.0.0.1:18096", "127.0.0.1:18095").replace(
-    "/kaiser?", "/stream#")
 
 
 def main():

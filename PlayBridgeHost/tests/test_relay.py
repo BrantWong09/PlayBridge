@@ -4,8 +4,14 @@
 - bytes=0- 同样走主路径
 - 回看：缓存内 Range 命中 → 206
 """
-import re, threading, time
+import os
+import re
+import sys
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 TOTAL = 8 * 1024 * 1024
 def byte_at(i): return (i * 37 + 11) % 251

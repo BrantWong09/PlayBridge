@@ -2,6 +2,8 @@
 
 把 Android 端 TVBox/影视仓 的"外部播放器"意图桥到 Windows 本地播放器（mpv）。
 
+> 只想把它跑起来？见 [RUNNING.md](RUNNING.md)（前置条件、启动、安装、排障）。
+
 ```
 TVBox/影视仓 ──ACTION_VIEW──▶ PlayBridge (Android) ──POST /play──▶ PlayBridgeHost (Windows) ──▶ mpv
                                   (FakePlayerProbe)      控制面(小JSON)          数据面(adb forward + 本地环形中继)

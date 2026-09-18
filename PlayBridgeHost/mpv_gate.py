@@ -66,62 +66,6 @@ class Gate(threading.Thread):
             return None
         return cache - pos
 
-    def _show(self, f):
-        """把窗口从最小化里拉出来：实测起播/跳转后它常被最小化，用户看不到画面。"""
-        try:
-            self._cmd(f, ["set_property", "window-minimized", False])
-        except Exception:
-            pass
-
-    def _keep_visible(self, seconds=90.0):
-        """起播这段最容易出现"窗口被最小化"，期间独立连接盯一下。"""
-        try:
-            g = open(PIPE, "r+b", buffering=0)
-        except OSError:
-            return
-        rid = 900000
-        t0 = time.time()
-        while time.time() - t0 < seconds:
-            try:
-                rid += 1
-                g.write((json.dumps({
-                    "command": ["get_property", "window-minimized"],
-                    "request_id": rid}) + "\n").encode())
-                data = None
-                while True:
-                    line = g.readline()
-                    if not line:
-                        return
-                    try:
-                        m = json.loads(line)
-                    except ValueError:
-                        continue
-                    if m.get("request_id") == rid:
-                        if m.get("error") == "success":
-                            data = m.get("data")
-                        break
-                if data:
-                    rid += 1
-                    g.write((json.dumps({
-                        "command": ["set_property", "window-minimized",
-                                    False],
-                        "request_id": rid}) + "\n").encode())
-                    while True:
-                        line = g.readline()
-                        if not line:
-                            return
-                        try:
-                            m = json.loads(line)
-                        except ValueError:
-                            continue
-                        if m.get("request_id") == rid:
-                            break
-                    self.log("gate: 窗口被最小化了 → 已拉回前台")
-            except (OSError, ValueError):
-                return
-            time.sleep(2)
-        g.close()
-
     # ---------- 主循环 ----------
     def run(self):
         f = self._connect()
@@ -129,8 +73,6 @@ class Gate(threading.Thread):
             self.log("gate: 连不上 mpv IPC，seek 预缓冲未生效")
             return
         self.log("gate: 已挂上（seek 后重新攒 %.0fs）" % PRE)
-        self._show(f)
-        threading.Thread(target=self._keep_visible, daemon=True).start()
         try:
             while True:
                 line = f.readline()          # 阻塞等事件
@@ -160,7 +102,6 @@ class Gate(threading.Thread):
                     time.sleep(POLL)
                 if not was_paused:
                     self._cmd(f, ["set_property", "pause", False])
-                self._show(f)
                 self.log("gate: seek 后缓存 %.1fs → 继续播放"
                          % (ahead if ahead is not None else -1))
         except (EOFError, OSError, ValueError) as e:

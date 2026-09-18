@@ -44,14 +44,27 @@ def log(msg):
 
 
 def ensure_forward():
-    """确保 adb forward tcp:18096 -> 模拟器 tcp:8096 存在（幂等）"""
+    """确保设备已连上 adb 并建立 forward tcp:18096 -> 模拟器 tcp:8096（幂等）。
+
+    以前只做 forward、不 connect，也不看返回码：一旦 adb server 丢了设备
+    （MuMu 重启/adb 重启），forward 静默失败，中继就一直 ConnectionRefused。
+    这里补上 connect 并把失败打进日志，配合 ring_relay 的重连钩子可自愈。
+    """
     try:
-        subprocess.run(
+        subprocess.run([ADB, "connect", DEVICE],
+                       capture_output=True, timeout=10)
+        r = subprocess.run(
             [ADB, "-s", DEVICE, "forward", "tcp:%d" % FORWARD_PORT,
              "tcp:%d" % PROXY_PORT],
             capture_output=True, timeout=10)
+        if r.returncode != 0:
+            err = (r.stderr or b"").decode("utf-8", "replace").strip()
+            log("adb forward 失败: %s" % (err or "exit %d" % r.returncode))
+        else:
+            log("adb forward 就绪: tcp:%d -> %s tcp:%d"
+                % (FORWARD_PORT, DEVICE, PROXY_PORT))
     except (OSError, subprocess.TimeoutExpired) as e:
-        log("adb forward 失败: %s" % e)
+        log("adb forward 异常: %s" % e)
 
 
 def rewrite_url(url):
@@ -59,34 +72,6 @@ def rewrite_url(url):
     控制面（Android 端）不感知，改写只发生在 Host。"""
     return url.replace("127.0.0.1:%d" % PROXY_PORT,
                        "127.0.0.1:%d" % FORWARD_PORT)
-
-
-def bring_mpv_to_front(pid, tries=6):
-    """窗口可能创建稍晚于进程启动，轮询找它的顶级窗口并置前"""
-    import ctypes
-    user32 = ctypes.windll.user32
-    seen_pid = ctypes.c_ulong()
-
-    def enum_proc():
-        found = []
-
-        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
-        def cb(hwnd, lparam):
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(seen_pid))
-            if seen_pid.value == pid and user32.IsWindowVisible(hwnd):
-                found.append(hwnd)
-            return True
-        user32.EnumWindows(cb, 0)
-        return found
-
-    for _ in range(tries):
-        for hwnd in enum_proc():
-            user32.ShowWindow(hwnd, 9)    # SW_RESTORE
-            user32.BringWindowToTop(hwnd)
-            user32.SetForegroundWindow(hwnd)
-            return True
-        time.sleep(0.5)
-    return False
 
 
 def capture_raw(play_url, seconds=25):
@@ -184,7 +169,6 @@ def handle_play(data):
         MPV,
         "--force-window=yes",
         "--autofit=80%",
-        "--ontop=yes",                    # 置顶，避免被 MuMu 窗口盖住
         "--log-file=" + os.path.join(BASE, "mpv.log"),
         "--msg-level=curl=v,stream=v",
         "--input-ipc-server=\\\\.\\pipe\\playbridge_mpv",
@@ -213,7 +197,6 @@ def handle_play(data):
         mpv_proc = subprocess.Popen(args)
         log("  mpv 已拉起 (pid=%d)" % mpv_proc.pid)
         mpv_gate.start(log)               # seek 后重新攒够预缓冲再放行
-        bring_mpv_to_front(mpv_proc.pid)
 
         def watch(proc=mpv_proc, u=play_url):
             code = proc.wait()
@@ -261,6 +244,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     host_ip = socket.gethostbyname(socket.gethostname())
+    # 上游持续不可用时重跑 adb forward（隧道也可能掉），让泵自动恢复
+    ring_relay.set_reconnect_hook(ensure_forward)
     log("PlayBridge Host 启动: 端口 %d (本机IP %s)" % (PORT, host_ip))
     try:
         server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
