@@ -240,6 +240,14 @@ class Pump:
                     self.lock.notify_all()
                 return
             try:
+                # 已经喂到文件尾：别再发 bytes=<size>-（非法范围，百度回 400
+                # "param error, http_range"，泵会一路当成故障重连下去）
+                with self.lock:
+                    if self.total and self.read_pos >= self.total:
+                        self.eof = True
+                        self._pump_idle = True
+                        self.lock.notify_all()
+                        return
                 conn = http.client.HTTPConnection(self.host, self.port,
                                                   timeout=SILENT)
                 with self.lock:
@@ -455,17 +463,55 @@ class Pump:
                         self.lock.notify_all()
         return self._bypass_fetch(start, length)
 
-    def _bypass_fetch(self, start, length):
+    def _bypass_fetch(self, start, length, tries=3):
+        """单发 Range，带重试。
+
+        CDN 节点会偶发 400/403/连接被掐（实测换片后第一次「尾部索引读」就撞上）。
+        这个读对索引在文件尾的 mp4 是起播必需的，而 mpv 对"首次打开流失败"是
+        直接空转不重试的（idle-active=True），所以重试必须在中继里做完，
+        否则一次瞬时抖动就变成"这个片子播不了"。
+        """
+        last = None
+        for i in range(tries):
+            try:
+                return self._bypass_once(start, length)
+            except (UpstreamError, http.client.HTTPException, OSError) as e:
+                last = e
+                if self.disposed:
+                    break
+                if i + 1 < tries:
+                    self.log("ring: 旁路失败 %r，%.1fs 后重试(%d/%d)"
+                             % (e, 0.4 * (i + 1), i + 1, tries))
+                    time.sleep(0.4 * (i + 1))
+        raise last
+
+    def _bypass_once(self, start, length):
         if self.disposed:
             return b""
+        if self.total and start >= self.total:
+            return b""               # 越界起点 = EOF，别发非法 range（百度回 400）
+        rng = "bytes=%d-" % start
         conn = http.client.HTTPConnection(self.host, self.port, timeout=45)
         try:
             conn.request("GET", self.path, headers={
                 "User-Agent": UA, "Accept": "*/*",
-                "Range": "bytes=%d-" % start, "Icy-MetaData": "1"})
+                "Range": rng, "Icy-MetaData": "1"})
             r = conn.getresponse()
+            if r.status == 416:          # 起点已在文件尾 → 当 EOF，别当故障
+                self.note_upstream_ok()
+                return b""
             if r.status not in (200, 206):
-                raise UpstreamError("bypass status %s" % r.status)
+                # 把服务器给的理由带上：CDN 的 400 有时是"URL 过期/签名不符"，
+                # 只看到状态码根本没法判断该重试还是该让用户重新起播
+                body = b""
+                try:
+                    body = r.read(300)
+                except Exception:
+                    pass
+                raise UpstreamError(
+                    "bypass status %s %s | sent Range: %s (total=%s) | %s" % (
+                        r.status, r.reason, rng, self.total,
+                        body.decode("utf-8", "replace").strip()))
             self.note_upstream_ok()
             self.ctype = r.getheader("Content-Type") or self.ctype
             data = b""
@@ -495,6 +541,12 @@ class Pump:
     def get(self, start, end):
         """[start, end] 含端点。"""
         self.note_read(start)
+        # 起点已在文件尾 → 就是 EOF，直接回空。绝不能把它当"前跳"去发 range：
+        # bytes=<size>- 是非法范围，百度会回 400 "param error, http_range"，
+        # 而 handler 拿到异常会给 mpv 一个 502，mpv 对首次打开失败是直接空转的
+        # （实测：索引在文件尾的 mp4 因此完全起不来）。
+        if self.total and start >= self.total:
+            return b""
         # 大跨度前跳：泵追不上，直接旁路（否则等 20s 才反应过来）
         with self.lock:
             if start > self.read_pos + 4 * CHUNK or start < self.base:
