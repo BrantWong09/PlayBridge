@@ -7,12 +7,14 @@ PlayBridge Host (Windows, MVP)
 以后接 mpv/PotPlayer 只需要改 handle_play()。
 """
 import json
+import http.client
 import os
 import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -33,6 +35,12 @@ DEVICE = ""
 MUMU_PORTS = (16384, 7555, 5555, 62001, 62025, 16416)   # 无设备时依次 connect 尝试
 PROXY_PORT = 8096                 # 模拟器内影视仓代理端口
 FORWARD_PORT = 18096              # Windows 本地隧道端口
+# 优先直连上游：影视仓的 /kaiser 只是「按 UA 放行的透传」，直连能整层拿掉
+# 模拟器代理 + adb 隧道。实测某 13.9GB 大 mp4 音视频不交错，mpv 必须同时读
+# 相距 400MB+ 的两个位置，kaiser 代理对这种交替跳读每秒被放弃一次就会挂死；
+# 直连下这只是两次普通 range 请求。置 False 即回落到 /kaiser 老路。
+USE_DIRECT = True
+UPSTREAM_UA = ring_relay.UA       # 上游按 UA 白名单放行：伪装成影视仓自家 ExoPlayer
 WUKONG_PKG = "com.huawei.himovceie"                              # 影视仓包名
 WUKONG_ACT = "com.github.tvbox.osc.ui.activity.HomeActivity"     # 启动 Activity
 
@@ -264,6 +272,50 @@ def capture_raw(play_url, seconds=25):
         log("  [capture] 失败: %r" % e)
 
 
+def extract_inner_url(url):
+    """影视仓的代理 URL 里裹着真正的上游直链：
+    http://127.0.0.1:8096/kaiser?url=<encoded>&thread=... → 取出 url= 参数。"""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        if "kaiser" not in parts.path:
+            return ""
+        inner = (urllib.parse.parse_qs(parts.query).get("url") or [""])[0]
+        if inner.startswith(("http://", "https://")):
+            return inner
+    except ValueError:
+        pass
+    return ""
+
+
+def probe_direct(url, timeout=8):
+    """直连探测：2xx 且真拿到字节才算可用（kaiser 对非白名单 UA 会回 200+0 字节）。"""
+    p = urllib.parse.urlsplit(url)
+    if p.scheme not in ("http", "https"):
+        return False
+    path = p.path + ("?" + p.query if p.query else "")
+    try:
+        if p.scheme == "https":
+            conn = http.client.HTTPSConnection(p.hostname, p.port, timeout=timeout)
+        else:
+            conn = http.client.HTTPConnection(p.hostname, p.port, timeout=timeout)
+        try:
+            conn.request("GET", path, headers={
+                "User-Agent": UPSTREAM_UA, "Accept": "*/*",
+                "Range": "bytes=0-65535"})
+            r = conn.getresponse()
+            ok = r.status in (200, 206)
+            head = r.read(4096)
+        finally:
+            conn.close()
+        if not (ok and head):
+            log("  直连上游不可用: status=%s got=%d 字节" % (r.status, len(head)))
+            return False
+        return True
+    except Exception as e:
+        log("  直连上游失败: %r" % e)
+        return False
+
+
 def handle_play(data):
     """收到播放请求 → 拉起 mpv 播放"""
     global mpv_proc
@@ -290,7 +342,16 @@ def handle_play(data):
         log("=" * 60)
         return
 
-    if "127.0.0.1:%d" % PROXY_PORT in url:
+    direct = ""
+    if USE_DIRECT:
+        inner = extract_inner_url(url)
+        if inner and probe_direct(inner):
+            direct = inner
+    if direct:
+        ring_relay.stop_target()      # 别让旧泵继续走模拟器代理空转
+        play_url = direct
+        log("  直连上游（绕开模拟器代理与 adb 隧道）")
+    elif "127.0.0.1:%d" % PROXY_PORT in url:
         ensure_forward()
         play_url = rewrite_url(url)
         log("  代理型源 → 走隧道 %s" % ("127.0.0.1:%d" % FORWARD_PORT))
@@ -302,20 +363,26 @@ def handle_play(data):
         threading.Thread(target=capture_raw, args=(play_url,), daemon=True).start()
         return
 
-    is_proxy = "127.0.0.1:%d" % FORWARD_PORT in play_url
-    if is_proxy and ring_relay.USE_RELAY:
+    # 中继不只是为了隧道：非交错的大 mp4（音视频数据相距几十~几百 MB）会让
+    # ffmpeg 的 mov demuxer 每秒发起约 2 次 stream-level seek，每次都是一条新的
+    # HTTP 请求（实测直连也只有 ~90KB/s，一直 buffering）。经中继后这些"跳读"
+    # 落在环里就是内存拷贝，只有超出环的才回上游。所以直连上游也要走中继。
+    use_relay = bool(direct) or ("127.0.0.1:%d" % FORWARD_PORT in play_url)
+    need_ua = False
+    if use_relay and ring_relay.USE_RELAY:
         ring_relay.ensure_started(port=ring_relay.RELAY_PORT, log=log)
         log("  中继连接上游...")
-        ring = ring_relay.set_target(play_url, log)
+        ring = ring_relay.set_target(play_url, log, serialize=not direct)
         if ring is None:
-            log("  中继建立失败，mpv 直连隧道")
+            log("  中继建立失败，mpv 直连上游")
             mpv_url = play_url
-            is_proxy = False
+            need_ua = bool(direct)
         else:
             mpv_url = "http://127.0.0.1:%d/stream" % ring_relay.RELAY_PORT
             log("  经单流环形中继 :%d" % ring_relay.RELAY_PORT)
     else:
         mpv_url = play_url
+        need_ua = bool(direct) or ("127.0.0.1:%d" % FORWARD_PORT in play_url)
 
     args = [
         MPV,
@@ -329,17 +396,21 @@ def handle_play(data):
         "--no-resume-playback",
         # 起播不要等太久：8s 缓冲即开播，后续由中继环形缓冲兜底
         "--demuxer-readahead-secs=8",
-        "--demuxer-max-bytes=256MiB",
-        "--demuxer-max-back-bytes=64MiB",
+        "--demuxer-max-bytes=512MiB",
+        "--demuxer-max-back-bytes=256MiB",  # 音视频不交错的大 mp4：mpv 要来回读两个
+                                            # 相距 400MB+ 的位置，回看缓存给足才不用重下
         "--cache=yes",
-        "--cache-secs=30",                # 预缓冲目标：攒够 30s 再开播
-        "--demuxer-cache-wait=yes",       # 起播前先等缓存达标（实测有效）
+        "--cache-secs=60",                # 直连后上游够快，缓冲拉大吸收抖动
+        "--hwdec=auto-safe",              # 5K HEVC 走 NVDEC 硬解：软解要吃 2+ 核，
+                                          # 还会和模拟器抢 CPU（MuMu 已累计 3000s+）
+        # 不要 --demuxer-cache-wait=yes：它是「攒够 cache-secs 才起播」，而视频
+        # 输出窗口是起播时才创建的——上游一卡就永远不建窗口（进程活着、
+        # MainWindowHandle=0，表现就是「mpv 不跳出来」）。现在一有首帧就建窗口
+        # 并继续缓存到 30s，上游不健康时至少能看到窗口和缓冲状态。
     ]
-    if is_proxy and not ring_relay.USE_RELAY:
-        # kaiser 代理按 UA 白名单区别响应：必须伪装成影视仓自家 ExoPlayer
-        args += [
-            "--user-agent=com.android.chrome/131.0.6778.200 (Linux;Android 10) AndroidXMedia3/1.5.1",
-        ]
+    if need_ua:
+        # 上游按 UA 白名单放行（百度直链 / kaiser 代理都认这个）：伪装成影视仓自家 ExoPlayer
+        args += ["--user-agent=" + UPSTREAM_UA]
 
     if mpv_proc and mpv_proc.poll() is None:
         mpv_proc.terminate()

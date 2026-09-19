@@ -33,9 +33,16 @@ RECONNECT_HOOK_MIN = 60.0  # 重连钩子（重跑 adb forward）最小间隔（
 PROXY_RESTART_AFTER = 25.0     # 上游持续不可用这么久 → 判定代理挂死
 PROXY_RESTART_COOLDOWN = 120.0  # 两次"重启代理"的最小间隔（秒）
 RING_MAX = 200 << 20   # 超前 mpv 最多缓存量
-LOOKBACK = 24 << 20    # 滞后 mpv 保留量
+LOOKBACK = 512 << 20   # 滞后 mpv 保留量（兜底值，实际由"低水位钉住"决定，见 note_read）
+RING_HARD = 1536 << 20 # 低水位钉住时环的硬上限：超过就退回 LOOKBACK 规则
+PIN_TTL = 120.0        # 低水位多久没再被读到就失效（免得为一段旧数据一直占内存）
 BYPASS_CHUNK = 32 << 20
+TAIL_INDEX_WINDOW = 64 << 20   # 距文件尾这个范围内的高位读取一律当"读 mkv 索引"，
+                               # 不重定主泵（实测 13.9GB 的片子索引落在尾部前
+                               # 4.08MB 处，原先 1MB 的窗口把它误判成用户跳转，
+                               # 泵抛弃从 0 开始的健康长流去追尾部 → 代理被喂挂）
 AHEAD_SOFT = 120 << 20  # 领先播放器这么多之后开始降速（约 40s 的 4K 码流）
+JUMP_PERSIST = 20.0     # 远距离前跳要"同一位置连续被请求"多久才算真的换播放位置
 RATE_SOFT = 6 << 20     # 降速后的拉取上限（字节/秒）：够喂饱播放器即可
 UA = "com.android.chrome/131.0.6778.200 (Linux;Android 10) AndroidXMedia3/1.5.1"
 
@@ -61,13 +68,37 @@ class UpstreamError(Exception):
     pass
 
 
+def _is_upstream_failure(e):
+    """客户端（mpv）自己断的不算上游故障，其余超时/IO/协议错都算。
+
+    顺序要紧：http.client.RemoteDisconnected 同时继承 ConnectionResetError，
+    而代理「accept 后直接关连接、不回响应」抛的正是它。先判它，否则会被
+    当成 mpv 断流吞掉——实测一轮 324 次全被吞，看门狗一次都没触发。
+    """
+    if isinstance(e, (http.client.RemoteDisconnected, UpstreamError,
+                      TimeoutError, ConnectionRefusedError)):
+        return True
+    if isinstance(e, (BrokenPipeError, ConnectionResetError)):
+        return False
+    return isinstance(e, (OSError, http.client.HTTPException))
+
+
 class Pump:
 
-    def __init__(self, target_url, log=lambda m: None):
+    def __init__(self, target_url, log=lambda m: None, serialize=True):
         p = urllib.parse.urlsplit(target_url)
         self.host, self.port = p.hostname, p.port
         self.path = p.path + ("?" + p.query if p.query else "")
         self.log = log
+        # 上游是否必须串行（kaiser 代理：是；百度直链：否）
+        self.serialize_upstream = serialize
+        # 远距离前跳的"持续性"判定（见 jump_is_persistent）
+        self._jump_bucket = None
+        self._jump_hits = 0
+        self._jump_t = 0.0
+        # 低水位：mpv 最近读到过的最低位置（修剪基线不能越过它太多）
+        self.low_req = None
+        self.low_req_t = 0.0
         self.lock = threading.Condition()
         self.buf = bytearray()       # 绝对偏移 [base, read_pos)
         self.base = 0
@@ -84,10 +115,62 @@ class Pump:
         self._last_hook = 0.0        # 上次重连钩子的时间
         self._fail_since = None      # 本轮连续失败起点
         self._last_restart = 0.0     # 上次重启代理的时间
+        self._fail_lock = threading.Lock()   # 泵线程和 handler 线程都会记故障
         # 上游串行化：实测代理一次只服务一条流，并发会互相挤死。
         self._upstream_lock = threading.Lock()  # 保证同时只有一个 _bypass
         self._pause_req = False      # 旁路请求泵让出上游
         self._pump_idle = True       # 泵当前没有活跃的上游连接
+
+    # ---------- 上游可用性记账（泵和旁路共用） ----------
+    def note_upstream_ok(self):
+        """上游有过一次成功响应 → 连续失败窗口清零。
+
+        旁路也必须调：否则「泵被旁路暂停、旁路又超时」期间窗口只涨不落，
+        恢复播放后仍会被旧窗口判成持续不可用，白白重启影视仓。
+        """
+        with self._fail_lock:
+            self.strikes = 0
+            self._fail_since = None
+
+    def note_upstream_failure(self, e):
+        """记一次上游故障；持续不可用超过 PROXY_RESTART_AFTER 就重启代理。
+
+        泵和旁路都要走这里。实测代理「accept 但不应答」时，失败全发生在旁路
+        （handler → pump.get → _bypass，45s 超时），而泵此刻被旁路用
+        _pause_req 挂住、根本不报错：只记「请求失败」不计 strikes 的话看门狗
+        永远不触发，播放就一直黑屏（mpv 卡在 --demuxer-cache-wait 里连窗口
+        都不建）。判死只看「持续多久」，不再要求先攒够 MAX_STRIKES 次：
+        旁路一次超时就是 45s，等 4 次要三分钟，播放器早卡死了。
+        """
+        now = time.time()
+        with self._fail_lock:
+            if self._fail_since is None:
+                self._fail_since = now
+            self.strikes += 1
+            strikes = self.strikes
+            reconnect = (strikes >= MAX_STRIKES and _reconnect_hook is not None
+                         and now - self._last_hook >= RECONNECT_HOOK_MIN)
+            if reconnect:
+                self._last_hook = now
+            restart = (now - self._fail_since >= PROXY_RESTART_AFTER
+                       and now - self._last_restart >= PROXY_RESTART_COOLDOWN
+                       and _proxy_restart_hook is not None)
+            if restart:
+                self._last_restart = now
+                self._fail_since = now     # 给重启后的代理一个窗口
+        if strikes >= MAX_STRIKES:
+            self.log("ring: 上游连续 %d 次不可用(%r)，持续重连" % (strikes, e))
+        if reconnect:
+            try:
+                _reconnect_hook()
+            except Exception as e2:
+                self.log("ring: 重连钩子失败 %r" % e2)
+        if restart:
+            self.log("ring: 上游持续不可用 → 重启上游代理")
+            try:
+                _proxy_restart_hook()
+            except Exception as e2:
+                self.log("ring: 重启代理钩子失败 %r" % e2)
 
     # ---------- 泵 ----------
     def start(self):
@@ -172,8 +255,7 @@ class Pump:
                 if r.status not in (200, 206):
                     raise UpstreamError("status %s" % r.status)
                 self._cur_conn = conn
-                self.strikes = 0
-                self._fail_since = None
+                self.note_upstream_ok()
                 cr = r.getheader("Content-Range") or ""
                 m = re.match(r"bytes (\d+)-", cr)
                 pos = int(m.group(1)) if m else start
@@ -230,11 +312,17 @@ class Pump:
                     if more is None or more == b"":
                         if more == b"":
                             with self.lock:
-                                if not self.total or pos >= self.total:
+                                # 只有「这条流本来就从文件尾/越过文件尾开始」才算
+                                # 真 EOF（mpv 读 mkv 索引正是这种）。若流是在文件
+                                # 中间断掉、或上游把总长/起点报错（实测某片被报成
+                                # 13.9GB 而实际 4.1GB），判 EOF 会让之后每次读都
+                                # 走旁路，旁路风暴再把代理彻底压死。
+                                if self.total and start >= self.total:
                                     self.eof = True
                                 else:
-                                    self.log("ring: 泵流提前EOF(t=%dMB)"
-                                             " → 轮换" % (pos >> 20))
+                                    self.log(
+                                        "ring: 泵流提前EOF(t=%dMB, total=%s)"
+                                        " → 轮换" % (pos >> 20, self.total))
                         with self.lock:
                             if self.gen == gen:
                                 self.read_pos = pos
@@ -253,8 +341,14 @@ class Pump:
                             pos += len(more)
                             fed += len(more)
                             self.read_pos = pos
-                            # 修剪：不早于 served-LOOKBACK，受 served+RING_MAX 约束
+                            # 修剪：不早于 served-LOOKBACK；但若 mpv 最近读过更低的
+                            # 位置（如巨大索引区），就把基线钉在那儿，直到硬上限
                             min_keep = self.served - LOOKBACK
+                            with self._fail_lock:
+                                low = self.low_req
+                            if (low is not None and low < min_keep
+                                    and self.read_pos - low <= RING_HARD):
+                                min_keep = low
                             if self.base < min_keep:
                                 drop = min_keep - self.base
                                 del self.buf[:drop]
@@ -294,31 +388,7 @@ class Pump:
                     self.lock.notify_all()
                 if self.disposed:
                     return
-                now = time.time()
-                if self._fail_since is None:
-                    self._fail_since = now
-                self.strikes += 1
-                if self.strikes >= MAX_STRIKES:
-                    self.log("ring: 上游连续 %d 次不可用(%r)，持续重连"
-                             % (self.strikes, e))
-                    if (_reconnect_hook is not None
-                            and now - self._last_hook >= RECONNECT_HOOK_MIN):
-                        self._last_hook = now
-                        try:
-                            _reconnect_hook()
-                        except Exception as e2:
-                            self.log("ring: 重连钩子失败 %r" % e2)
-                    if (now - self._fail_since >= PROXY_RESTART_AFTER
-                            and now - self._last_restart
-                            >= PROXY_RESTART_COOLDOWN
-                            and _proxy_restart_hook is not None):
-                        self._last_restart = now
-                        self._fail_since = now     # 给重启后的代理一个窗口
-                        self.log("ring: 上游持续不可用 → 重启上游代理")
-                        try:
-                            _proxy_restart_hook()
-                        except Exception as e2:
-                            self.log("ring: 重启代理钩子失败 %r" % e2)
+                self.note_upstream_failure(e)
                 wait = min(2 ** min(self.strikes, 6), RECONNECT_MAX)
                 self.log("ring: 泵流建流失败 %r，%.0fs后重试(%d/%d)" % (
                     e, wait, self.strikes, MAX_STRIKES))
@@ -326,45 +396,88 @@ class Pump:
                     self.lock.notify_all()
                 time.sleep(wait)
 
-    # ---------- 旁路（跳读/回看，独占上游） ----------
+    # ---------- 旁路（跳读/回看） ----------
+    def note_read(self, start):
+        """记下 mpv 读过的位置，作为修剪的低水位。
+
+        非交错的大 mp4：mpv 一边以 ~2MB/s 推进数据位置，一边以 ~0.5KB/s 爬一个
+        巨大的索引区（实测 36MB 处）。两者的差距会一直变大，所以"served-LOOKBACK"
+        这种跟随式基线迟早把索引区剪掉 → 每次索引读都退化成上游旁路（实测
+        0.4 次/秒）→ 播放饿死。把基线钉在最近读到的最低位置上，直到 RING_HARD
+        上限或 PIN_TTL 过期。
+        """
+        now = time.time()
+        with self._fail_lock:
+            if (self.low_req is None or start < self.low_req
+                    or now - self.low_req_t > PIN_TTL):
+                self.low_req = start
+            self.low_req_t = now
+
+    def jump_is_persistent(self, start):
+        """这次远距离前跳值不值得让主泵跟过去。
+
+        非交错的大 mp4：mpv 每秒在"索引位置"和"数据位置"之间交替读，两个位置
+        相距几百 MB。若每次都重定主泵，泵就在两端乒乓、环永远攒不起来、播放
+        饿死（实测 100 秒内重定 162 次）。所以只在同一位置（8MB 粒度）被连续
+        请求时才重定——交替跳读永远只有 1 次命中，就老实走旁路（直连上游下
+        旁路只是几次廉价的范围请求）。
+        """
+        now = time.time()
+        bucket = start >> 23
+        with self._fail_lock:
+            if self._jump_bucket == bucket and now - self._jump_t <= JUMP_PERSIST:
+                self._jump_hits += 1
+            else:
+                self._jump_hits = 1
+            self._jump_bucket = bucket
+            self._jump_t = now
+            return self._jump_hits >= 2
+
     def _bypass(self, start, length):
         """单发 Range 拉到即断。
 
-        实测 kaiser 代理一次只服务一条流，并发请求会互相挤死；所以旁路
-        必须先让主泵断开上游、等它空闲，跑完再放泵回去续传。
+        kaiser 代理一次只服务一条流、并发会互相挤死，所以那条路上旁路必须先
+        让主泵断开上游、等它空闲，跑完再放泵回去续传（serialize_upstream）。
+        直连百度时不需要：并发 range 完全没问题，而"掐断主泵"恰恰是灾难——
+        非交错的大 mp4 每秒要跳读两次，每次掐断主泵都让环归零、播放饿死。
         """
-        with self._upstream_lock:
-            with self.lock:
-                self._pause_req = True
-                while not self._pump_idle and not self.disposed:
-                    self.lock.wait(0.1)
-            try:
-                if self.disposed:
-                    return b""
-                conn = http.client.HTTPConnection(self.host, self.port,
-                                                  timeout=45)
-                try:
-                    conn.request("GET", self.path, headers={
-                        "User-Agent": UA, "Accept": "*/*",
-                        "Range": "bytes=%d-" % start, "Icy-MetaData": "1"})
-                    r = conn.getresponse()
-                    if r.status not in (200, 206):
-                        raise UpstreamError("bypass status %s" % r.status)
-                    self.ctype = r.getheader("Content-Type") or self.ctype
-                    data = b""
-                    while len(data) < length:
-                        more = r.read(min(READ_BLOCK * 4,
-                                          length - len(data)))
-                        if not more:
-                            break
-                        data += more
-                    return data
-                finally:
-                    self._hard_close(conn)
-            finally:
+        if self.serialize_upstream:
+            with self._upstream_lock:
                 with self.lock:
-                    self._pause_req = False
-                    self.lock.notify_all()
+                    self._pause_req = True
+                    while not self._pump_idle and not self.disposed:
+                        self.lock.wait(0.1)
+                try:
+                    return self._bypass_fetch(start, length)
+                finally:
+                    with self.lock:
+                        self._pause_req = False
+                        self.lock.notify_all()
+        return self._bypass_fetch(start, length)
+
+    def _bypass_fetch(self, start, length):
+        if self.disposed:
+            return b""
+        conn = http.client.HTTPConnection(self.host, self.port, timeout=45)
+        try:
+            conn.request("GET", self.path, headers={
+                "User-Agent": UA, "Accept": "*/*",
+                "Range": "bytes=%d-" % start, "Icy-MetaData": "1"})
+            r = conn.getresponse()
+            if r.status not in (200, 206):
+                raise UpstreamError("bypass status %s" % r.status)
+            self.note_upstream_ok()
+            self.ctype = r.getheader("Content-Type") or self.ctype
+            data = b""
+            while len(data) < length:
+                more = r.read(min(READ_BLOCK * 4,
+                                  length - len(data)))
+                if not more:
+                    break
+                data += more
+            return data
+        finally:
+            self._hard_close(conn)
 
     # ---------- 对 mpv ----------
     def wait_for(self, upto):
@@ -381,6 +494,7 @@ class Pump:
 
     def get(self, start, end):
         """[start, end] 含端点。"""
+        self.note_read(start)
         # 大跨度前跳：泵追不上，直接旁路（否则等 20s 才反应过来）
         with self.lock:
             if start > self.read_pos + 4 * CHUNK or start < self.base:
@@ -412,7 +526,7 @@ class Pump:
         return got
 
 
-def set_target(target_url, log=lambda m: None):
+def set_target(target_url, log=lambda m: None, serialize=True):
     global _current
     with _current_lock:
         old = _current
@@ -420,11 +534,21 @@ def set_target(target_url, log=lambda m: None):
             old.disposed = True     # 让旧泵退出并 RST 掐线，释放代理会话
             _current = None
         try:
-            _current = Pump(target_url, log)
+            _current = Pump(target_url, log, serialize)
         except Exception as e:
             log("ring: 初始化失败 %r" % e)
             _current = None
     return _current
+
+
+def stop_target():
+    """停掉当前中继目标（切到直连上游时用）：别让旧泵继续走模拟器代理空转。"""
+    global _current
+    with _current_lock:
+        old = _current
+        _current = None
+    if old is not None:
+        old.disposed = True
 
 
 _started = False
@@ -520,15 +644,18 @@ def ensure_started(port=RELAY_PORT, log=lambda m: None):
                 start = int(m.group(1)) if m else 0
                 if pump.total:
                     if start > pump.read_pos + 4 * CHUNK \
-                            and start < pump.total - (1 << 20):
-                        # 真跳转（排除掉读文件尾索引那种随机读）：让泵跟到
-                        # 新位置，否则整段播放都得靠旁路并发拉上游。
+                            and start < pump.total - TAIL_INDEX_WINDOW \
+                            and pump.jump_is_persistent(start):
+                        # 真的换播放位置（同一位置被连续请求）才让泵跟过去
                         pump.retarget(start)
-                    elif start + CHUNK < pump.base:
-                        pump.retarget(start)      # 回看超出环
+                    # 回看不再重定主泵：交替跳读会把泵拖成乒乓，交给旁路（廉价）
                 self._stream_from(pump, start, 206 if m else 200)
             except Exception as e:
                 log("ring: 请求失败 %r" % e)
+                if _is_upstream_failure(e):
+                    # 旁路超时也要喂看门狗：代理「accept 但不应答」时失败都在
+                    # 这条路径上，泵被 _pause_req 挂住不报错，不记账就永远不触发
+                    pump.note_upstream_failure(e)
                 try:
                     self.send_error(502, str(e))
                 except Exception:
