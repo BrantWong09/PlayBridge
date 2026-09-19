@@ -26,7 +26,11 @@ MPV_LOG = os.path.join(BASE, "mpv.log")
 
 MPV = r"C:\Users\Administrator\AppData\Roaming\com.geon.quantumtv\mpv\mpv.exe"
 ADB = r"C:\Users\Administrator\AppData\Local\Android\Sdk\platform-tools\adb.exe"
-DEVICE = "127.0.0.1:16416"        # 影视仓所在的 MuMu 实例（MuMuManager 查询所得）
+# 影视仓所在的模拟器 adb 地址：启动时自动探测。MuMu 重启后 adb 端口会变
+# （实测同一实例在 16384/7555/5555 三个 transport 上，旧的 16416 直接拒连），
+# 写死会让 adb forward 静默失败、中继拿不到上游。要强制指定就用环境变量。
+DEVICE = ""
+MUMU_PORTS = (16384, 7555, 5555, 62001, 62025, 16416)   # 无设备时依次 connect 尝试
 PROXY_PORT = 8096                 # 模拟器内影视仓代理端口
 FORWARD_PORT = 18096              # Windows 本地隧道端口
 WUKONG_PKG = "com.huawei.himovceie"                              # 影视仓包名
@@ -45,28 +49,124 @@ def log(msg):
         pass
 
 
+def _adb_devices():
+    """adb devices 里 state=device 的序列号列表。"""
+    try:
+        r = subprocess.run([ADB, "devices"], capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    serials = []
+    for line in (r.stdout or b"").decode("utf-8", "replace").splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "device":
+            serials.append(parts[0])
+    return serials
+
+
+def _shell(serial, *cmd, timeout=15):
+    """跑一条 adb shell，返回 stdout 文本；失败返回空串。"""
+    try:
+        r = subprocess.run([ADB, "-s", serial, "shell"] + list(cmd),
+                           capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if r.returncode != 0:
+        return ""
+    return (r.stdout or b"").decode("utf-8", "replace")
+
+
+def _android_id(serial):
+    return _shell(serial, "settings", "get", "secure", "android_id").strip()
+
+
+def _has_wukong(serial):
+    """该设备上是否装了影视仓——多设备时用它挑对实例。"""
+    return ("package:%s" % WUKONG_PKG) in _shell(
+        serial, "pm", "list", "packages", WUKONG_PKG)
+
+
+def detect_device():
+    """探测影视仓所在的模拟器 adb 地址，返回 (serial, 依据)。
+
+    顺序：环境变量 PLAYBRIDGE_DEVICE > 装了影视仓的设备 > 第一个可用设备。
+    MuMu 会给同一实例暴露多个 transport（16384/7555/5555），按 android_id
+    去重，避免把同一个实例当成多台设备反复切换。
+    """
+    forced = os.environ.get("PLAYBRIDGE_DEVICE", "").strip()
+    if forced:
+        return forced, "环境变量 PLAYBRIDGE_DEVICE"
+
+    serials = _adb_devices()
+    if not serials:
+        for port in MUMU_PORTS:            # 模拟器起着但 adb 没连上
+            try:
+                subprocess.run([ADB, "connect", "127.0.0.1:%d" % port],
+                               capture_output=True, timeout=10)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        serials = _adb_devices()
+    if not serials:
+        return "", "未发现 adb 设备"
+
+    unique, seen = [], set()
+    for s in serials:
+        key = _android_id(s) or s
+        if key not in seen:
+            seen.add(key)
+            unique.append(s)
+    for s in unique:
+        if _has_wukong(s):
+            return s, "装了 %s" % WUKONG_PKG
+    return unique[0], "唯一可用设备"
+
+
+def current_device():
+    """DEVICE 为空时（启动时模拟器还没起）现场重探一次，用于自愈。"""
+    global DEVICE
+    if not DEVICE:
+        DEVICE, why = detect_device()
+        if DEVICE:
+            log("设备: %s (%s)" % (DEVICE, why))
+        else:
+            log("设备: 无可用 adb 设备 (%s)" % why)
+    return DEVICE
+
+
 def ensure_forward():
     """确保设备已连上 adb 并建立 forward tcp:18096 -> 模拟器 tcp:8096（幂等）。
 
     以前只做 forward、不 connect，也不看返回码：一旦 adb server 丢了设备
     （MuMu 重启/adb 重启），forward 静默失败，中继就一直 ConnectionRefused。
     这里补上 connect 并把失败打进日志，配合 ring_relay 的重连钩子可自愈。
+    设备地址是启动时探测的；若 adb 说设备没了（端口又变了），清掉缓存让
+    下一次重新探测，而不是一直对着死地址重试。
     """
+    global DEVICE
+    dev = current_device()
+    if not dev:
+        return
     try:
-        subprocess.run([ADB, "connect", DEVICE],
-                       capture_output=True, timeout=10)
+        if ":" in dev:                      # 只有 host:port 形式才能 connect
+            subprocess.run([ADB, "connect", dev],
+                           capture_output=True, timeout=10)
         r = subprocess.run(
-            [ADB, "-s", DEVICE, "forward", "tcp:%d" % FORWARD_PORT,
+            [ADB, "-s", dev, "forward", "tcp:%d" % FORWARD_PORT,
              "tcp:%d" % PROXY_PORT],
             capture_output=True, timeout=10)
         if r.returncode != 0:
             err = (r.stderr or b"").decode("utf-8", "replace").strip()
             log("adb forward 失败: %s" % (err or "exit %d" % r.returncode))
+            if "not found" in err or "offline" in err:
+                DEVICE = ""                 # 地址失效 → 下次重新探测
         else:
             log("adb forward 就绪: tcp:%d -> %s tcp:%d"
-                % (FORWARD_PORT, DEVICE, PROXY_PORT))
+                % (FORWARD_PORT, dev, PROXY_PORT))
     except (OSError, subprocess.TimeoutExpired) as e:
         log("adb forward 异常: %s" % e)
+
+
+def _wukong_alive(dev):
+    return bool(_shell(dev, "pidof", WUKONG_PKG).strip())
 
 
 def restart_proxy():
@@ -74,15 +174,47 @@ def restart_proxy():
 
     实测代理被喂挂后不会再应答，只有重启进程才能恢复；重启后同一条
     百度直链仍可经新代理继续播放，播放器不用换源。
+
+    两个坑（都实测踩过）：
+    1. 必须看 adb 的返回码，以前不看返回码、无条件打「已重启」，设备地址
+       失配时每轮都在空转却报健康，代理就一直挂着没人救。
+    2. `am start -n` 返回 0 也可能什么都没启动：外部播放把 PlayBridge 的
+       MainActivity 压进了影视仓的 task，系统会把 intent 投递给同 task 栈顶
+       的那个 Activity（回 "delivered to currently running top-most instance"），
+       影视仓进程不会被拉起。加 -S / NEW_TASK 都无效，只有 monkey 走
+       LAUNCHER intent 可靠。所以这里以 pidof 为准，起不来就换 monkey。
     """
+    dev = current_device()
+    if not dev:
+        log("ring: 重启影视仓失败: 无可用 adb 设备")
+        return
     try:
-        subprocess.run([ADB, "-s", DEVICE, "shell", "am", "force-stop",
+        subprocess.run([ADB, "-s", dev, "shell", "am", "force-stop",
                         WUKONG_PKG], capture_output=True, timeout=15)
         time.sleep(1)
-        subprocess.run([ADB, "-s", DEVICE, "shell", "am", "start", "-n",
-                        "%s/%s" % (WUKONG_PKG, WUKONG_ACT)],
-                       capture_output=True, timeout=15)
-        log("ring: 已重启影视仓以恢复上游代理")
+        r2 = subprocess.run([ADB, "-s", dev, "shell", "am", "start", "-n",
+                             "%s/%s" % (WUKONG_PKG, WUKONG_ACT)],
+                            capture_output=True, timeout=15)
+        for _ in range(5):                      # 冷启动要等脱壳，给 5s
+            if _wukong_alive(dev):
+                break
+            time.sleep(1)
+        if not _wukong_alive(dev):
+            err = (r2.stderr or b"").decode("utf-8", "replace").strip()
+            log("ring: am start 未拉起影视仓%s，改用 monkey"
+                % (": %s" % err if err else ""))
+            subprocess.run([ADB, "-s", dev, "shell", "monkey", "-p",
+                            WUKONG_PKG, "-c",
+                            "android.intent.category.LAUNCHER", "1"],
+                           capture_output=True, timeout=20)
+            for _ in range(10):
+                if _wukong_alive(dev):
+                    break
+                time.sleep(1)
+        if _wukong_alive(dev):
+            log("ring: 已重启影视仓以恢复上游代理")
+        else:
+            log("ring: 重启影视仓失败: 进程未起来（am start / monkey 都无效）")
     except (OSError, subprocess.TimeoutExpired) as e:
         log("ring: 重启影视仓失败: %s" % e)
 
@@ -263,7 +395,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    global DEVICE
     host_ip = socket.gethostbyname(socket.gethostname())
+    DEVICE, why = detect_device()
+    if DEVICE:
+        log("设备: %s (%s)" % (DEVICE, why))
+    else:
+        log("设备: 未探测到 adb 设备 (%s)；播放请求时会重探，"
+            "也可用 PLAYBRIDGE_DEVICE 指定" % why)
     # 上游持续不可用时重跑 adb forward（隧道也可能掉），让泵自动恢复
     ring_relay.set_reconnect_hook(ensure_forward)
     # 代理被喂挂（持续不可用）时重启影视仓，重建代理进程

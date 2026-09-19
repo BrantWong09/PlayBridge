@@ -35,6 +35,10 @@ python playbridge_host.py
 启动后：
 
 - 监听 `0.0.0.0:16888`，打印本机 IP。
+- 自动探测影视仓所在的模拟器 adb 地址：读 `adb devices`，按 `android_id` 去重
+  同一实例的多个 transport，优先选装了影视仓的设备，日志形如
+  `设备: 127.0.0.1:16384 (装了 com.huawei.himovceie)`。要强制指定就用环境变量
+  `PLAYBRIDGE_DEVICE=127.0.0.1:16416`。
 - 每次收到播放请求时，若源是影视仓网盘代理，会自动执行
   `adb forward tcp:18096 tcp:8096`。
 - 日志同时打印到控制台并写入 `PlayBridgeHost/playbridge.log`
@@ -82,7 +86,7 @@ App 内点一下会自动保存到 SharedPreferences。
 |------|--------|------|
 | `MPV` | `C:\Users\Administrator\AppData\Roaming\com.geon.quantumtv\mpv\mpv.exe` | mpv 可执行文件 |
 | `ADB` | `C:\Users\Administrator\AppData\Local\Android\Sdk\platform-tools\adb.exe` | adb 路径 |
-| `DEVICE` | `127.0.0.1:16416` | MuMu 实例的 adb 地址（用 `adb devices` 查） |
+| ~~`DEVICE`~~ | 启动时自动探测 | 不再写死。MuMu 重启后 adb 端口会变（实测同一实例在 16384/7555/5555 三个 transport 上，旧的 16416 直接拒连），写死会让 `adb forward` 静默失败、中继拿不到上游。要指定时用环境变量 `PLAYBRIDGE_DEVICE` |
 | `PROXY_PORT` | `8096` | 模拟器内影视仓代理端口 |
 | `FORWARD_PORT` | `18096` | 本机隧道端口 |
 | `PORT` | `16888` | 控制面端口 |
@@ -129,7 +133,7 @@ python watch_session.py 270 30   # 观察 270 秒，每 30 秒采样一次
 | mpv 报 `no target` / HTTP 503 | 还没收到播放请求就访问了中继；先在影视仓发起一次播放 |
 | mpv 卡住或日志里 `TimeoutError`、`RemoteDisconnected` | 上游代理短暂不可用。中继会带退避持续重连，恢复后自动续传；若长时间不恢复，多半是代理被喂挂了，见下方「上游代理实测行为」 |
 | 上游返回 `200 + 0 字节` | kaiser 代理按 User-Agent 白名单放行；确认走的是中继（会伪装 UA），不要用浏览器直接拉 |
-| `adb devices` 为空 | 模拟器没起或端口变了；用 `adb connect 127.0.0.1:<port>`，并同步改 `DEVICE` |
+| `adb devices` 为空 | 模拟器没起或 adb 端口变了；Host 会自动 `adb connect` 常见 MuMu 端口（16384/7555/5555/62001/62025）重试，且地址一旦失效下次播放请求会重新探测。要指定用 `PLAYBRIDGE_DEVICE` |
 | 换片/跳转后短暂停顿 | 正常：seek 后中继重定 + 预缓冲闸门在重新攒约 30s 缓存 |
 
 ### 上游代理实测行为（排障关键）
@@ -152,6 +156,10 @@ python watch_session.py 270 30   # 观察 270 秒，每 30 秒采样一次
 两次重启至少间隔 `PROXY_RESTART_COOLDOWN`（120s）。
 
 - 日志标志：`ring: 上游持续不可用 → 重启上游代理` / `ring: 已重启影视仓以恢复上游代理`。
+  若出现 `ring: am start 未拉起影视仓…改用 monkey` 属正常兜底：外部播放会把
+  PlayBridge 的 Activity 压在影视仓 task 的栈顶，此时 `am start`（加不加 `-S`、
+  `NEW_TASK` 都一样）会把 intent 投递给栈顶那个 Activity 而静默不启动影视仓，
+  所以重启后以 `pidof` 为准、起不来就换 monkey 走 LAUNCHER intent。
 - 相关常量：`ring_relay.py` 的 `PROXY_RESTART_AFTER` / `PROXY_RESTART_COOLDOWN`；
   影视仓包名/Activity 在 `playbridge_host.py` 的 `WUKONG_PKG` / `WUKONG_ACT`。
 - 注意：看门狗会**强制重启影视仓**（它的界面会重置），但 mpv 播放会自动续上。
