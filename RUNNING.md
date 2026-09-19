@@ -39,8 +39,12 @@ python playbridge_host.py
   同一实例的多个 transport，优先选装了影视仓的设备，日志形如
   `设备: 127.0.0.1:16384 (装了 com.huawei.himovceie)`。要强制指定就用环境变量
   `PLAYBRIDGE_DEVICE=127.0.0.1:16416`。
-- 每次收到播放请求时，若源是影视仓网盘代理，会自动执行
-  `adb forward tcp:18096 tcp:8096`。
+- 每次收到播放请求时，先把影视仓代理 URL 里裹着的**百度直链**解出来直连
+  （日志 `直连上游（绕开模拟器代理与 adb 隧道）`）：这样数据面完全不经过模拟器。
+  直连探测失败才回落老路，那时才 `adb forward tcp:18096 tcp:8096` 走隧道 + kaiser 代理。
+  整体开关是 `playbridge_host.py` 的 `USE_DIRECT`。
+- 数据面无论走哪条路都经过本地中继（`:18095`）：它的环形缓冲把 mpv 的
+  「两个相距几百 MB 的位置交替读」变成内存里的范围读，这是流畅播放的关键。
 - 日志同时打印到控制台并写入 `PlayBridgeHost/playbridge.log`
   （控制台若重定向，通常会存成 `host_console.log`）。
 
@@ -87,6 +91,8 @@ App 内点一下会自动保存到 SharedPreferences。
 | `MPV` | `C:\Users\Administrator\AppData\Roaming\com.geon.quantumtv\mpv\mpv.exe` | mpv 可执行文件 |
 | `ADB` | `C:\Users\Administrator\AppData\Local\Android\Sdk\platform-tools\adb.exe` | adb 路径 |
 | ~~`DEVICE`~~ | 启动时自动探测 | 不再写死。MuMu 重启后 adb 端口会变（实测同一实例在 16384/7555/5555 三个 transport 上，旧的 16416 直接拒连），写死会让 `adb forward` 静默失败、中继拿不到上游。要指定时用环境变量 `PLAYBRIDGE_DEVICE` |
+| `USE_DIRECT` | `True` | 直连上游（绕开模拟器代理 + 隧道）；`False` 则所有播放都走 `/kaiser` + 隧道老路 |
+| `MPV_VERBOSE` | 由 `PLAYBRIDGE_MPV_VERBOSE` 决定 | 置 `1` 才让 mpv 写 `mpv.log` |
 | `PROXY_PORT` | `8096` | 模拟器内影视仓代理端口 |
 | `FORWARD_PORT` | `18096` | 本机隧道端口 |
 | `PORT` | `16888` | 控制面端口 |
@@ -122,8 +128,8 @@ python watch_session.py 270 30   # 观察 270 秒，每 30 秒采样一次
 | 文件 | 内容 |
 |------|------|
 | `host_console.log` | Host 运行日志（播放请求、中继轮换、重连） |
-| `playbridge.log` | 控制面 POST 记录 |
-| `mpv.log` | mpv 详细日志（`--msg-level=curl=v,stream=v`） |
+| `playbridge.log` | 控制面 POST 记录 + 中继日志。重复消息按「数字归一化后的文本」折叠：同一个 key 5 秒内只输出一条，被压掉的次数附在下一条后面（`[同类消息又出现 N 次]`）。超过 2MB 时启动会归档成 `playbridge.log.1` |
+| `mpv.log` | **默认不产生**。mpv 的 `--log-file` 不受 `--msg-level` 约束（实测 `--no-config --msg-level=all=error` 也照样写满 `[v]`/`[d]`，这个 mpv 是 debug 构建），一集 4K 片能刷几十 MB 的 `stream level seek`。要排查数据面时 `set PLAYBRIDGE_MPV_VERBOSE=1` 再启动 Host |
 | `last_play.json` | 最近一次完整播放请求（含完整 URL），供离线调试（URL 会过期） |
 
 ### 常见问题

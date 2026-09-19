@@ -9,6 +9,7 @@ PlayBridge Host (Windows, MVP)
 import json
 import http.client
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -41,18 +42,66 @@ FORWARD_PORT = 18096              # Windows 本地隧道端口
 # 直连下这只是两次普通 range 请求。置 False 即回落到 /kaiser 老路。
 USE_DIRECT = True
 UPSTREAM_UA = ring_relay.UA       # 上游按 UA 白名单放行：伪装成影视仓自家 ExoPlayer
+# mpv 的日志级别：默认只留 info/warn/error。curl=v,stream=v 会把每一次
+# stream level seek 都写下来（实测 6 分钟 3.2 万行、2.1MB，占 mpv.log 的 95%），
+# 排查数据面时才需要。要开：set PLAYBRIDGE_MPV_VERBOSE=1
+MPV_VERBOSE = os.environ.get("PLAYBRIDGE_MPV_VERBOSE", "") not in ("", "0")
 WUKONG_PKG = "com.huawei.himovceie"                              # 影视仓包名
 WUKONG_ACT = "com.github.tvbox.osc.ui.activity.HomeActivity"     # 启动 Activity
 
+LOG_DUP_SEC = 5.0        # 同一条消息（数字归一化后）至少间隔这么久才再打一次
+LOG_DUP_MAX_KEYS = 2000  # 归一化消息的记账上限，超了清空重来
+LOG_ROTATE = 2 << 20     # playbridge.log 超过这么大，启动时归档一份
+
 mpv_proc = None
+# 最近一次播放是否走直连上游：直连时 aborts 来自百度侧，重跑 adb forward 没意义，
+# 重启影视仓更是只会把用户界面重置掉，所以两个自愈钩子都要跳过。
+last_play_direct = False
+_log_seen = {}           # normalize(msg) -> [上次输出时间, 被折叠掉的次数]
+_log_lock = threading.Lock()
 
 
-def log(msg):
+def log(msg, force=False):
+    """写一行日志；重复消息折叠。
+
+    数据面重连/轮换时同一句话会每秒刷几十条（实测一轮 2902 条「只给 N 字节」），
+    日志大到没法看。这里按「数字归一化后的文本」归并：同一个 key 在
+    LOG_DUP_SEC 内只输出一条，被压掉的条数附在下一次输出后面，
+    所以"发生过、发生了几次"仍然看得到。force=True 用于要求必打的行。
+    """
+    now = time.time()
+    key = re.sub(r"\d+", "N", msg)
+    with _log_lock:
+        st = _log_seen.get(key)
+        if st is None:
+            if len(_log_seen) >= LOG_DUP_MAX_KEYS:
+                _log_seen.clear()
+            _log_seen[key] = [now, 0]
+        elif not force and now - st[0] < LOG_DUP_SEC:
+            st[1] += 1
+            return
+        else:
+            if st[1]:
+                msg = "%s  [同类消息又出现 %d 次]" % (msg, st[1])
+            st[0] = now
+            st[1] = 0
     line = "[%s] %s" % (datetime.now().strftime("%H:%M:%S"), msg)
     print(line, flush=True)
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def rotate_log():
+    """启动时把过大的日志归档成 .1，别让历史会话无限堆积。"""
+    try:
+        if os.path.getsize(LOG_FILE) > LOG_ROTATE:
+            bak = LOG_FILE + ".1"
+            if os.path.exists(bak):
+                os.remove(bak)
+            os.replace(LOG_FILE, bak)
     except OSError:
         pass
 
@@ -234,6 +283,25 @@ def rewrite_url(url):
                        "127.0.0.1:%d" % FORWARD_PORT)
 
 
+def reconnect_hook():
+    """上游持续不可用 → 重跑 adb forward（隧道可能掉了）。直连上游时无隧道可修。"""
+    if last_play_direct:
+        return
+    ensure_forward()
+
+
+def proxy_restart_hook():
+    """上游持续不可用 → 重启影视仓重建 kaiser 代理。
+
+    直连上游时这一步毫无帮助：abort 来自百度侧，重启影视仓只会把用户的
+    影视仓界面重置掉（实测直连播放时它每隔 75~120 秒就来一次）。
+    """
+    if last_play_direct:
+        log("ring: 直连上游，跳过重启影视仓（只重连）")
+        return
+    restart_proxy()
+
+
 def capture_raw(play_url, seconds=25):
     """诊断用：单发 Range GET，读取至多 512KB 并记录前 512 字节 hex"""
     import http.client
@@ -318,18 +386,21 @@ def probe_direct(url, timeout=8):
 
 def handle_play(data):
     """收到播放请求 → 拉起 mpv 播放"""
-    global mpv_proc
+    global mpv_proc, last_play_direct
 
     url = data.get("url") or ""
-    log("=" * 60)
-    log("PLAY REQUEST")
-    log("  version  = %s" % data.get("version"))
-    log("  action   = %s" % data.get("action"))
-    log("  title    = %s" % data.get("title"))
-    log("  position = %s" % data.get("position"))
+    # 请求块一律强制输出：否则两次播放挨得近时会被去重吃掉，看不懂发生了什么
+    log("=" * 60, force=True)
+    log("PLAY REQUEST", force=True)
+    log("  version  = %s" % data.get("version"), force=True)
+    log("  action   = %s" % data.get("action"), force=True)
+    log("  title    = %s" % data.get("title"), force=True)
+    log("  position = %s" % data.get("position"), force=True)
     if data.get("extras"):
-        log("  extras   = %s" % json.dumps(data["extras"], ensure_ascii=False))
-    log("  URL      = %s" % url[:120] + ("..." if len(url) > 120 else ""))
+        log("  extras   = %s" % json.dumps(data["extras"], ensure_ascii=False),
+            force=True)
+    log("  URL      = %s" % url[:120] + ("..." if len(url) > 120 else ""),
+        force=True)
     # 完整 URL 另存一份，供离线重放调试（会随时间过期）
     try:
         with open(os.path.join(BASE, "last_play.json"), "w", encoding="utf-8") as f:
@@ -339,7 +410,7 @@ def handle_play(data):
 
     if not url:
         log("  无 URL，忽略")
-        log("=" * 60)
+        log("=" * 60, force=True)
         return
 
     direct = ""
@@ -347,6 +418,7 @@ def handle_play(data):
         inner = extract_inner_url(url)
         if inner and probe_direct(inner):
             direct = inner
+    last_play_direct = bool(direct)
     if direct:
         ring_relay.stop_target()      # 别让旧泵继续走模拟器代理空转
         play_url = direct
@@ -388,8 +460,6 @@ def handle_play(data):
         MPV,
         "--force-window=yes",
         "--autofit=80%",
-        "--log-file=" + os.path.join(BASE, "mpv.log"),
-        "--msg-level=curl=v,stream=v",
         "--input-ipc-server=\\\\.\\pipe\\playbridge_mpv",
         "--title=PlayBridge",
         "--no-ytdl",                      # 禁止 ytdl-hook 把 URL 当网页重新解析（曾导致自动跳到别的片段）
@@ -412,6 +482,14 @@ def handle_play(data):
         # 上游按 UA 白名单放行（百度直链 / kaiser 代理都认这个）：伪装成影视仓自家 ExoPlayer
         args += ["--user-agent=" + UPSTREAM_UA]
 
+    if MPV_VERBOSE:
+        # mpv.log 默认不开：--log-file 不受 --msg-level 约束（实测即使
+        # --no-config --msg-level=all=error，文件里照样写满 [v]/[d]，这个 mpv 是
+        # debug 构建），一集 4K 片能刷几十 MB 的 stream-level seek。
+        # 要排查数据面时：set PLAYBRIDGE_MPV_VERBOSE=1
+        args += ["--log-file=" + MPV_LOG,
+                 "--msg-level=curl=v,stream=v"]
+
     if mpv_proc and mpv_proc.poll() is None:
         mpv_proc.terminate()
 
@@ -427,7 +505,7 @@ def handle_play(data):
         threading.Thread(target=watch, daemon=True).start()
     except OSError as e:
         log("  启动 mpv 失败: %s" % e)
-    log("=" * 60)
+    log("=" * 60, force=True)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -467,6 +545,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     global DEVICE
+    rotate_log()
     host_ip = socket.gethostbyname(socket.gethostname())
     DEVICE, why = detect_device()
     if DEVICE:
@@ -475,9 +554,9 @@ def main():
         log("设备: 未探测到 adb 设备 (%s)；播放请求时会重探，"
             "也可用 PLAYBRIDGE_DEVICE 指定" % why)
     # 上游持续不可用时重跑 adb forward（隧道也可能掉），让泵自动恢复
-    ring_relay.set_reconnect_hook(ensure_forward)
+    ring_relay.set_reconnect_hook(reconnect_hook)
     # 代理被喂挂（持续不可用）时重启影视仓，重建代理进程
-    ring_relay.set_proxy_restart_hook(restart_proxy)
+    ring_relay.set_proxy_restart_hook(proxy_restart_hook)
     log("PlayBridge Host 启动: 端口 %d (本机IP %s)" % (PORT, host_ip))
     try:
         server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
